@@ -1,0 +1,201 @@
+#version 430 core
+layout(local_size_x = 16, local_size_y = 8) in;
+layout(binding = 0, rgba32f) uniform image2D outImage;
+layout(binding = 2) uniform sampler1D uBlackbody;
+
+uniform vec3 uCameraPosition, uCameraRight, uCameraUp, uCameraForward;
+uniform float uAspect, uTanHalfFov, uTime;
+uniform int uObjectCount, uSampleIndex, uPreview;
+uniform vec4 uObjects[16], uObjectColors[16];
+uniform ivec2 uOffset, uExtent;
+uniform vec2 uJitter;
+
+const float PI = 3.141592653589793;
+const float DISK_INNER = 3.0;
+const float DISK_OUTER = 12.0;
+
+struct Ray { vec3 p; vec3 v; float angularMomentumSquared; };
+
+float hash21(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+float noise2(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x),
+               mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y);
+}
+float fbm(vec2 p) {
+    float value = 0.0, amplitude = 0.5;
+    mat2 rotate = mat2(0.8, 0.6, -0.6, 0.8);
+    for (int i = 0; i < 6; ++i) {
+        value += amplitude * noise2(p);
+        p = rotate * p * 2.03 + vec2(7.1, 13.7);
+        amplitude *= 0.5;
+    }
+    return value;
+}
+vec3 thermal(float temperature) {
+    float coordinate = clamp(log(max(temperature, 800.0) / 800.0) / log(100.0), 0.0, 1.0);
+    return textureLod(uBlackbody, coordinate, 0.0).rgb;
+}
+
+vec3 acceleration(vec3 p, float angularMomentumSquared) {
+    float r2 = max(dot(p, p), 0.25);
+    return -1.5 * angularMomentumSquared * p / (r2 * r2 * sqrt(r2));
+}
+Ray advanceRay(Ray ray, float h) {
+    vec3 a1 = acceleration(ray.p, ray.angularMomentumSquared);
+    vec3 v2 = ray.v + h * 0.5 * a1;
+    vec3 a2 = acceleration(ray.p + h * 0.5 * ray.v, ray.angularMomentumSquared);
+    vec3 v3 = ray.v + h * 0.5 * a2;
+    vec3 a3 = acceleration(ray.p + h * 0.5 * v2, ray.angularMomentumSquared);
+    vec3 v4 = ray.v + h * a3;
+    vec3 a4 = acceleration(ray.p + h * v3, ray.angularMomentumSquared);
+    ray.p += h * (ray.v + 2.0 * v2 + 2.0 * v3 + v4) / 6.0;
+    ray.v += h * (a1 + 2.0 * a2 + 2.0 * a3 + a4) / 6.0;
+    return ray;
+}
+float sphereHit(vec3 start, vec3 end, vec3 center, float radius) {
+    vec3 d = end - start, m = start - center;
+    float a = dot(d, d);
+    if (a < 1e-16) return 2.0;
+    if (dot(m, m) < radius * radius) return 0.0;
+    float closest = -dot(m, d) / a;
+    vec3 perpendicular = m + closest * d;
+    float delta = radius * radius - dot(perpendicular, perpendicular);
+    if (delta < 0.0) return 2.0;
+    float t = closest - sqrt(delta / a);
+    return (t >= 0.0 && t <= 1.0) ? t : 2.0;
+}
+
+vec3 skyColor(vec3 direction) {
+    vec3 d = normalize(direction);
+    vec3 n = normalize(vec3(0.3, 0.85, 0.43));
+    float latitude = dot(d, n);
+    float longitude = atan(d.z, d.x);
+    vec2 skyUV = vec2(longitude / (2.0 * PI) + 0.5,
+                      acos(clamp(d.y, -1.0, 1.0)) / PI);
+    float band = exp(-latitude * latitude * 75.0);
+    float dust = fbm(skyUV * vec2(40.0, 20.0));
+    vec3 color = vec3(0.00006, 0.00008, 0.00015)
+               + band * pow(dust, 2.0) * vec3(0.004, 0.0045, 0.006);
+    for (int layer = 0; layer < 2; ++layer) {
+        vec2 dimensions = layer == 0 ? vec2(720.0, 360.0) : vec2(1600.0, 800.0);
+        vec2 grid = skyUV * dimensions;
+        vec2 cell = floor(grid), f = fract(grid);
+        float seed = hash21(cell + float(layer) * 71.0);
+        if (seed > (layer == 0 ? 0.987 : 0.997)) {
+            vec2 center = vec2(hash21(cell + vec2(3.1, 7.2)), hash21(cell + vec2(8.4, 2.7)));
+            center = mix(vec2(0.25), vec2(0.75), center);
+            float radius = length(f - center);
+            float profile = exp(-radius * radius / (layer == 0 ? 0.003 : 0.007));
+            vec3 tint = thermal(mix(3200.0, 14000.0, hash21(cell + 19.0)));
+            tint /= max(max(tint.r, tint.g), max(tint.b, 0.001));
+            color += tint * profile * (layer == 0 ? 2.8 : 0.45);
+        }
+    }
+    return color;
+}
+
+vec3 diskEmission(Ray ray, float observerLapse) {
+    float r = length(ray.p);
+    float angle = atan(ray.p.z, ray.p.x);
+    vec3 radial = ray.p / r;
+    float lapse = sqrt(max(1.0 - 1.0 / r, 0.001));
+    float radialVelocity = dot(ray.v, radial);
+    vec3 toObserver = -normalize(ray.v + radial * radialVelocity * (1.0 / lapse - 1.0));
+    vec3 orbitDirection = normalize(vec3(-ray.p.z, 0.0, ray.p.x));
+    float beta = sqrt(1.0 / (2.0 * (r - 1.0)));
+    float gamma = inversesqrt(1.0 - beta * beta);
+    float shift = (lapse / observerLapse) /
+                  (gamma * (1.0 - beta * dot(orbitDirection, toObserver)));
+
+    float orbitPhase = angle - uTime * sqrt(0.5 / (r * r * r));
+    vec2 turbulenceUV = vec2(cos(orbitPhase), sin(orbitPhase)) * r * 3.3;
+    float turbulence = fbm(turbulenceUV);
+    float filaments = 0.5 + 0.5 * sin(r * 53.0 + turbulence * 13.0 + orbitPhase * 4.0);
+    float flux = max(1.0 - sqrt(DISK_INNER / r), 0.0) / (r * r * r);
+    float temperature = 43000.0 * pow(flux, 0.25);
+    temperature *= 0.87 + 0.19 * turbulence + 0.07 * filaments;
+    float outerFade = 1.0 - smoothstep(DISK_OUTER - 1.5, DISK_OUTER, r);
+    return thermal(temperature * shift) * outerFade * (0.7 + 0.65 * turbulence);
+}
+
+vec3 trace(vec3 direction) {
+    Ray ray;
+    ray.p = uCameraPosition;
+    float cameraRadius = length(ray.p);
+    float observerLapse = sqrt(max(1.0 - 1.0 / cameraRadius, 0.001));
+    vec3 radial = ray.p / cameraRadius;
+    float radialDirection = dot(direction, radial);
+    ray.v = direction + radial * radialDirection * (observerLapse - 1.0);
+    vec3 momentum = cross(ray.p, ray.v);
+    ray.angularMomentumSquared = dot(momentum, momentum);
+    float escapeRadius = max(256.0, cameraRadius * 2.0);
+    int steps = uPreview != 0 ? 1536 : 4096;
+
+    for (int i = 0; i < steps; ++i) {
+        Ray previous = ray;
+        float radius = length(ray.p);
+        if (radius <= 1.0001) return vec3(0.0);
+        float h = clamp(radius * (uPreview != 0 ? 0.07 : 0.027) / max(length(ray.v), 0.1), 0.002, 5.0);
+        ray = advanceRay(previous, h);
+
+        float nearest = sphereHit(previous.p, ray.p, vec3(0.0), 1.0);
+        int objectHit = -1;
+        for (int j = 0; j < uObjectCount; ++j) {
+            if (uObjects[j].w <= 0.0) continue;
+            float t = sphereHit(previous.p, ray.p, uObjects[j].xyz, uObjects[j].w);
+            if (t < nearest) { nearest = t; objectHit = j; }
+        }
+
+        if (previous.p.y * ray.p.y <= 0.0 && abs(previous.p.y - ray.p.y) > 1e-7) {
+            float lo = 0.0, hi = h;
+            Ray crossing = previous;
+            for (int refine = 0; refine < 6; ++refine) {
+                float mid = 0.5 * (lo + hi);
+                crossing = advanceRay(previous, mid);
+                if (previous.p.y * crossing.p.y > 0.0) lo = mid; else hi = mid;
+            }
+            float crossingStep = 0.5 * (lo + hi);
+            crossing = advanceRay(previous, crossingStep);
+            float diskRadius = length(crossing.p.xz);
+            if (diskRadius >= DISK_INNER && diskRadius <= DISK_OUTER && crossingStep / h < nearest)
+                return diskEmission(crossing, observerLapse);
+        }
+        if (nearest < 2.0) {
+            if (objectHit < 0) return vec3(0.0);
+            vec3 hit = mix(previous.p, ray.p, nearest);
+            vec3 normal = normalize(hit - uObjects[objectHit].xyz);
+            float limb = 0.45 + 0.55 * max(dot(normal, -normalize(ray.v)), 0.0);
+            return uObjectColors[objectHit].rgb * limb * 2.2;
+        }
+        if (length(ray.p) > escapeRadius && dot(ray.p, ray.v) > 0.0)
+            return skyColor(ray.v);
+    }
+    return vec3(0.0);
+}
+
+void main() {
+    ivec2 localPixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(localPixel, uExtent))) return;
+    ivec2 pixel = localPixel + uOffset;
+    ivec2 size = imageSize(outImage);
+    if (any(greaterThanEqual(pixel, size))) return;
+    vec2 scramble = vec2(hash21(vec2(pixel)), hash21(vec2(pixel) + vec2(37.0, 17.0)));
+    vec2 jitter = uPreview != 0 ? vec2(0.5) : fract(uJitter + scramble);
+    vec2 uv = (vec2(pixel) + jitter) / vec2(size);
+    vec2 screen = (2.0 * uv - 1.0) * vec2(uAspect, 1.0) * uTanHalfFov;
+    vec3 direction = normalize(uCameraForward + screen.x * uCameraRight + screen.y * uCameraUp);
+    vec3 sampleColor = trace(direction);
+    if (any(isnan(sampleColor)) || any(isinf(sampleColor))) sampleColor = vec3(0.0);
+    vec3 mean = sampleColor;
+    if (uSampleIndex > 0) {
+        vec3 previous = imageLoad(outImage, pixel).rgb;
+        mean = previous + (sampleColor - previous) / float(uSampleIndex + 1);
+    }
+    imageStore(outImage, pixel, vec4(mean, float(uSampleIndex + 1)));
+}

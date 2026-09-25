@@ -1,0 +1,4 @@
+/blackhole
+*.o
+*.ppm
+.DS_Store
